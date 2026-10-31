@@ -34,6 +34,7 @@ class CameraInfo(NamedTuple):
     image_name: str
     width: int
     height: int
+    point3D_ids: np.array
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -99,7 +100,8 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         image = Image.open(image_path)
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                              image_path=image_path, image_name=image_name, width=width, height=height)
+                              image_path=image_path, image_name=image_name, width=width, height=height,
+                              point3D_ids=extr.point3D_ids)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
@@ -214,7 +216,8 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             FovX = fovx
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1]))
+                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1],
+                            point3D_ids=None))
             
     return cam_infos
 

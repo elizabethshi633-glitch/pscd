@@ -11,6 +11,7 @@
 
 import torch
 import numpy as np
+import torch.nn.functional as F
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
 import os
@@ -400,6 +401,119 @@ class GaussianModel:
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         self.prune_points(prune_mask)
 
+        torch.cuda.empty_cache()
+
+    def reset_densification_stats(self):
+        """Reset gradient/radius accumulators after a density-control event."""
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+    @torch.no_grad()
+    def densify_and_prune_role_aware(self, clone_indices, split_indices,
+                                     split_directions, split_direction_valid,
+                                     min_opacity, extent, max_screen_size,
+                                     split_displacement, covariance_anisotropy):
+        """PSCD-GS clone/split insertion followed by the baseline pruning rules.
+
+        ``clone_indices`` preserve their parent and add an identical primitive.
+        ``split_indices`` replace their parent with two smaller children.  A
+        reliable PSCD direction is used first; otherwise the principal covariance
+        axis is used when anisotropic, with the original random covariance sample
+        as the final fallback.
+        """
+        device = self.get_xyz.device
+        clone_indices = clone_indices.to(device=device, dtype=torch.long)
+        split_indices = split_indices.to(device=device, dtype=torch.long)
+        point_count = self.get_xyz.shape[0]
+
+        new_xyz_parts = []
+        new_dc_parts = []
+        new_rest_parts = []
+        new_opacity_parts = []
+        new_scaling_parts = []
+        new_rotation_parts = []
+
+        if clone_indices.numel() > 0:
+            new_xyz_parts.append(self._xyz[clone_indices])
+            new_dc_parts.append(self._features_dc[clone_indices])
+            new_rest_parts.append(self._features_rest[clone_indices])
+            new_opacity_parts.append(self._opacity[clone_indices])
+            new_scaling_parts.append(self._scaling[clone_indices])
+            new_rotation_parts.append(self._rotation[clone_indices])
+
+        if split_indices.numel() > 0:
+            scales = self.get_scaling[split_indices]
+            rotations = build_rotation(self._rotation[split_indices])
+            split_count = split_indices.numel()
+            if split_directions is None or split_direction_valid is None:
+                split_directions = torch.zeros((split_count, 3), device=device, dtype=self._xyz.dtype)
+                split_direction_valid = torch.zeros(split_count, device=device, dtype=torch.bool)
+            else:
+                split_directions = split_directions.to(device=device, dtype=self._xyz.dtype)
+                split_direction_valid = split_direction_valid.to(device=device, dtype=torch.bool)
+
+            ordered_scales, ordered_axes = torch.sort(scales, dim=1, descending=True)
+            local_axis = F.one_hot(ordered_axes[:, 0], num_classes=3).to(self._xyz.dtype)
+            covariance_axis = torch.bmm(rotations, local_axis.unsqueeze(-1)).squeeze(-1)
+            covariance_axis = F.normalize(covariance_axis, dim=1)
+            covariance_confident = ((ordered_scales[:, 0].square() - ordered_scales[:, 1].square()) /
+                                    ordered_scales[:, 0].square().clamp_min(1e-8)) >= covariance_anisotropy
+            use_axis = split_direction_valid | covariance_confident
+            direction = torch.where(split_direction_valid[:, None], split_directions, covariance_axis)
+            direction = F.normalize(direction, dim=1)
+
+            # sqrt(d^T Sigma d), evaluated through the factor L = R diag(s).
+            local_direction = torch.bmm(rotations.transpose(1, 2), direction.unsqueeze(-1)).squeeze(-1)
+            directional_std = torch.sqrt((local_direction.square() * scales.square()).sum(dim=1).clamp_min(1e-8))
+            parents = self._xyz[split_indices].repeat_interleave(2, dim=0)
+            signs = torch.tensor((-1.0, 1.0), device=device, dtype=self._xyz.dtype).repeat(split_count)
+            deterministic_xyz = parents + signs[:, None] * split_displacement * directional_std.repeat_interleave(2)[:, None] * direction.repeat_interleave(2, dim=0)
+
+            # Keep the original 3DGS random-covariance initialization only when
+            # neither image evidence nor covariance anisotropy is informative.
+            stds = scales.repeat_interleave(2, dim=0)
+            random_local = torch.normal(mean=torch.zeros_like(stds), std=stds)
+            random_rotation = rotations.repeat_interleave(2, dim=0)
+            random_xyz = parents + torch.bmm(random_rotation, random_local.unsqueeze(-1)).squeeze(-1)
+            child_xyz = torch.where(use_axis.repeat_interleave(2)[:, None], deterministic_xyz, random_xyz)
+
+            new_xyz_parts.append(child_xyz)
+            new_dc_parts.append(self._features_dc[split_indices].repeat_interleave(2, dim=0))
+            new_rest_parts.append(self._features_rest[split_indices].repeat_interleave(2, dim=0))
+            new_opacity_parts.append(self._opacity[split_indices].repeat_interleave(2, dim=0))
+            child_scale = self.scaling_inverse_activation(scales / (0.8 * 2.0))
+            new_scaling_parts.append(child_scale.repeat_interleave(2, dim=0))
+            new_rotation_parts.append(self._rotation[split_indices].repeat_interleave(2, dim=0))
+
+        if new_xyz_parts:
+            self.densification_postfix(
+                torch.cat(new_xyz_parts, dim=0),
+                torch.cat(new_dc_parts, dim=0),
+                torch.cat(new_rest_parts, dim=0),
+                torch.cat(new_opacity_parts, dim=0),
+                torch.cat(new_scaling_parts, dim=0),
+                torch.cat(new_rotation_parts, dim=0))
+            # Splits replace their parent; clones retain theirs.  The indices are
+            # still valid because all children were appended after the old set.
+            if split_indices.numel() > 0:
+                split_parent_mask = torch.zeros(self.get_xyz.shape[0], dtype=torch.bool, device=device)
+                split_parent_mask[split_indices] = True
+                self.prune_points(split_parent_mask)
+        else:
+            self.reset_densification_stats()
+
+        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        if max_screen_size:
+            big_points_vs = self.max_radii2D > max_screen_size
+            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        if prune_mask.any():
+            self.prune_points(prune_mask)
+        # An event with no additions does not enter densification_postfix, yet
+        # PSCD-GS still starts the next interval with fresh statistics.
+        if self.xyz_gradient_accum.shape[0] != self.get_xyz.shape[0]:
+            self.reset_densification_stats()
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):

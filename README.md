@@ -69,6 +69,44 @@ The components have different requirements w.r.t. both hardware and software. Th
 
 The optimizer uses PyTorch and CUDA extensions in a Python environment to produce trained models. 
 
+### PSCD-GS role-aware densification
+
+This fork adds the density-control modules from *PSCD-GS: Role-Aware
+Perception-Structure Collaborative Densification for 3D Gaussian Splatting*.
+They are opt-in and do not alter the original renderer, loss, PLY format, or the
+baseline training path.
+
+```shell
+python train.py -s <path to COLMAP dataset> --eval --pscd
+```
+
+With `--pscd`, every scheduled densification event now performs the following
+steps:
+
+- precomputes frozen VGG-16 perceptual-response maps and image axes once;
+- renders alpha-composited depth, builds depth/boundary structural responses,
+  and gates them by multi-view reprojection reliability;
+- maps both evidence fields to Gaussians with contribution-weighted alpha
+  compositing statistics, then constructs continuous perceptual-dominant,
+  structural-dominant, co-dominant, and low-response roles;
+- uses the roles for growth-budgeted candidate priority, clone-versus-split
+  selection, and confidence-aware directional child placement, followed by the
+  original opacity and scale pruning rules.
+
+The default `--pscd_perceptual_backbone vgg16` requires torchvision's ImageNet
+VGG-16 weights to already be locally available. It is the paper-faithful
+perceptual branch. On an offline machine, use
+`--pscd_perceptual_backbone sobel` to retain the complete role-aware pipeline
+with a multi-scale image-gradient fallback; it is an engineering fallback, not
+the paper's reported VGG-16 setting. The contribution pass intentionally reuses
+the installed differentiable rasterizer rather than changing its CUDA interface,
+so PSCD mode has a higher training-time cost and no additional inference cost.
+
+All PSCD parameters are visible through `python train.py --help`; their defaults
+match the paper's Table 1. Checkpoints created with PSCD preserve the two
+evidence-calibration EMA ranges and remain resumable. Existing checkpoints are
+also accepted, with fresh calibration ranges.
+
 ### Hardware Requirements
 
 - CUDA-ready GPU with Compute Capability 7.0+

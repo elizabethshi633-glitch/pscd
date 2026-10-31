@@ -88,6 +88,48 @@ class OptimizationParams(ParamGroup):
         self.densify_grad_threshold = 0.0002
         super().__init__(parser, "Optimization Parameters")
 
+class PSCDParams(ParamGroup):
+    """Configuration for PSCD-GS density control.
+
+    The defaults follow Table 1 of "PSCD-GS: Role-Aware
+    Perception-Structure Collaborative Densification".  The feature extractor is
+    deliberately opt-in: a regular 3DGS invocation remains bit-for-bit on the
+    original density-control path unless ``--pscd`` is supplied.
+    """
+    def __init__(self, parser):
+        self.pscd = False
+        self.pscd_perceptual_backbone = "vgg16"
+        self.pscd_neighbors = 4
+        self.pscd_q_low = 0.05
+        self.pscd_q_high = 0.95
+        self.pscd_contribution_threshold = 1e-4
+        self.pscd_visibility_views = 3.0
+        self.pscd_edge_weight = 3.0 / 7.0
+        self.pscd_depth_weight = 4.0 / 7.0
+        self.pscd_min_reliability = 0.3
+        self.pscd_depth_threshold = 0.05
+        self.pscd_depth_sigma = 0.05
+        self.pscd_structure_sigma = 0.20
+        self.pscd_role_slope = 10.0
+        self.pscd_role_threshold = 0.5
+        self.pscd_calibration_ema = 0.9
+        self.pscd_evidence_sigma = 0.25
+        self.pscd_evidence_bonus = 0.4
+        self.pscd_priority_threshold = 0.6
+        self.pscd_growth_rate = 0.05
+        self.pscd_max_candidates = 50_000
+        self.pscd_max_gaussians = 5_000_000
+        self.pscd_codominant_split = 0.5
+        self.pscd_split_threshold = 0.5
+        self.pscd_jacobian_ridge = 1e-4
+        self.pscd_direction_support = 1e-3
+        self.pscd_fit_sigma = 0.25
+        self.pscd_direction_views = 3.0
+        self.pscd_direction_threshold = 0.25
+        self.pscd_covariance_anisotropy = 0.20
+        self.pscd_split_displacement = 0.5
+        super().__init__(parser, "PSCD-GS Parameters")
+
 def get_combined_args(parser : ArgumentParser):
     cmdlne_string = sys.argv[1:]
     cfgfile_string = "Namespace()"
